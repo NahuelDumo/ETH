@@ -1,0 +1,54 @@
+{
+  "api_key": "c16726da824853e1ecce1e2dd0d5e332",
+  "api_secret": "65f77089bec92513c67d0a67ffb4f51e",
+  "telegram_token": "8282044587:AAG4nqJoaYf8mKq8ca8uyvot_LpfFxyyH-s",
+  "telegram_chat_id": "-4834826625",
+  "symbols": ["ETHUSDT", "SOLUSDT", "HYPEUSDT", "SUIUSDT"],
+  "initial_balance": 1000,
+  "enable_macd_filter": true,
+  "macd_fast": 12,
+  "macd_slow": 26,
+  "macd_signal": 9,
+  "max_concurrent_open": 4,
+  "leverage_per_symbol": {
+    "ETHUSDT": 15,
+    "SOLUSDT": 15,
+    "HYPEUSDT": 15, 
+    "SUIUSDT": 10
+  },
+  "symbol_configs": {
+    "ETHUSDT": {
+      "enable_structural_stop": true,
+      "tp_percentage": 1.8,
+      "sl_percentage": 0.9,
+      "risk_reward_ratio": 2.0
+    },
+    "SOLUSDT": {
+      "enable_structural_stop": false,
+      "tp_percentage": 2.2,
+      "sl_percentage": 1.1,
+      "risk_reward_ratio": 2.0
+    },
+    "HYPEUSDT": {
+      "enable_structural_stop": true,
+      "tp_percentage": 2.5,
+      "sl_percentage": 1.25,
+      "risk_reward_ratio": 2.0
+    },
+    "SUIUSDT": {
+      "enable_structural_stop": false,
+      "tp_percentage": 2,
+      "sl_percentage": 1.25,
+      "risk_reward_ratio": 2.0
+    }
+  },
+  "wallet_tracking": {
+    "enabled": true,
+    "wallet_address": "0xc2a30212a8ddac9e123944d6e29faddce994e5f2",
+    "etherscan_api_key": "XKYDCVBIN5NA3Z6EBH4W4R1267JS1TXVI8",
+    "moralis_api_key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImNhNDZiMGVmLTljNWUtNDZjZC04Yzc4LTdlMTc2ZjQxODM4NCIsIm9yZ0lkIjoiNDc3NDkxIiwidXNlcklkIjoiNDkxMjUzIiwidHlwZUlkIjoiZjQzNzZiZGQtMGZmYS00ZjgwLTgyM2QtNDdmNWMyMGY1ZGY2IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjEyNjk0MTksImV4cCI6NDkxNzAyOTQxOX0.d3D9RCErujDtSwVZew5ZypdpUZG3LwSXcwjfO_KjrU8",
+
+    "copy_trading": true,
+    "check_interval": 0.5
+  }
+}

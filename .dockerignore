@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.log
+*.xlsx
+.env
+.git
+.gitignore
+.vscode
+.idea
