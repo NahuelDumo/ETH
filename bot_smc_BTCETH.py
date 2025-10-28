@@ -1078,6 +1078,67 @@ class SmartMoneyLiveBot:
         logger.warning(f"[{symbol}] SIMULACIÓN: Orden {log_prefix} {direction} NO enviada a Bitunix.")
         await self.notify_entry(pos) # Notificar (en simulación)
         # --- Fin Simulación ---
+    
+    async def close_position(self, symbol: str, exit_price: float, reason: str = "Manual") -> None:
+        """
+        Cierra una posición activa, calcula el PnL, actualiza el balance y registra el trade.
+        
+        Args:
+            symbol: Símbolo de la posición a cerrar
+            exit_price: Precio de salida
+            reason: Razón del cierre (ej: "Take Profit", "Stop Loss", "Copy Trading Close")
+        """
+        pos = self.positions.get(symbol)
+        if not pos:
+            logger.warning(f"[{symbol}] No hay posición activa para cerrar.")
+            return
+        
+        try:
+            # Calcular PnL
+            if pos.direction == 'LONG':
+                pnl = (exit_price - pos.entry_price) * pos.size
+            else:  # SHORT
+                pnl = (pos.entry_price - exit_price) * pos.size
+            
+            # Actualizar balance
+            self.balance += pnl
+            
+            # Crear registro del trade
+            exit_time = pd.Timestamp.now(tz='UTC')
+            trade_record = {
+                'symbol': symbol,
+                'entry_time': pos.entry_time,
+                'exit_time': exit_time,
+                'direction': pos.direction,
+                'entry_price': pos.entry_price,
+                'exit_price': exit_price,
+                'stop_loss': pos.stop_loss,
+                'take_profit': pos.take_profit,
+                'liquidation_price': pos.liquidation_price,
+                'position_size': pos.size,
+                'margin_used': pos.margin_used,
+                'pnl': pnl,
+                'exit_reason': reason
+            }
+            
+            # Guardar en Excel
+            self._save_trade_to_excel(trade_record)
+            
+            # Notificar por Telegram
+            await self.notify_exit(trade_record)
+            
+            # Limpiar posición
+            self.positions[symbol] = None
+            
+            # Guardar estado persistente
+            await self._save_persistent_positions()
+            
+            logger.info(f"[{symbol}] Posición cerrada exitosamente. PnL: ${pnl:,.2f}, Balance: ${self.balance:,.2f}")
+            
+        except Exception as e:
+            logger.error(f"[{symbol}] Error al cerrar posición: {e}", exc_info=True)
+            await self.send_telegram_message(f"🚨 Error crítico al cerrar {symbol}: {e}")
+    
     async def manage_position(self, symbol: str, idx: int):
         """
         Gestiona la salida de un trade activo (SMC) usando la lógica HÍBRIDA (BASADA EN TIEMPO).
