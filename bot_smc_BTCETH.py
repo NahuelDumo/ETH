@@ -1748,11 +1748,17 @@ class SmartMoneyLiveBot:
             
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=user_payload) as response:
+                    logger.info(f"📡 Status code API Hyperliquid: {response.status}")
                     if response.status == 200:
                         data = await response.json()
+                        logger.info(f"📡 Respuesta API Hyperliquid: {data}")
+                        
                         margin_summary = data.get("marginSummary", {})
-                        total_margin = float(margin_summary.get("totalMargin", 0))
-                        total_pnl = float(margin_summary.get("totalUnrealizedPnl", 0))
+                        if not margin_summary:
+                            logger.warning(f"⚠️ marginSummary vacío o None. Data completa: {data}")
+                        
+                        total_margin = float(margin_summary.get("totalMargin") or 0)
+                        total_pnl = float(margin_summary.get("totalUnrealizedPnl") or 0)
                         
                         # Agregar resumen de cuenta
                         message += (
@@ -1763,24 +1769,30 @@ class SmartMoneyLiveBot:
                         
                         # Obtener detalles de cada posición
                         positions_data = data.get("assetPositions", [])
+                        logger.info(f"📊 Posiciones encontradas en API: {len(positions_data)}")
+                        
+                        if not positions_data:
+                            logger.warning(f"⚠️ No se encontraron posiciones en assetPositions. Verificar estructura de data.")
                         
                         for idx, item in enumerate(positions_data, 1):
                             position_data = item.get("position", {})
+                            logger.debug(f"Procesando posición {idx}: {position_data}")
+                            
                             symbol = position_data.get("coin", "UNKNOWN")
-                            size = float(position_data.get("szi", 0))
+                            size = float(position_data.get("szi") or 0)
                             
                             if size == 0:
                                 continue
                             
                             direction = "🟢 LONG" if size > 0 else "🔴 SHORT"
-                            entry_price = float(position_data.get("entryPx", 0))
-                            position_value = float(position_data.get("positionValue", 0))
-                            unrealized_pnl = float(position_data.get("unrealizedPnl", 0))
-                            liq_price = float(position_data.get("liquidationPx", 0))
+                            entry_price = float(position_data.get("entryPx") or 0)
+                            position_value = float(position_data.get("positionValue") or 0)
+                            unrealized_pnl = float(position_data.get("unrealizedPnl") or 0)
+                            liq_price = float(position_data.get("liquidationPx") or 0)
                             
                             leverage_info = position_data.get("leverage", {})
-                            leverage_type = leverage_info.get("type", "cross")
-                            leverage_value = leverage_info.get("value", 1)
+                            leverage_type = leverage_info.get("type") or "cross"
+                            leverage_value = leverage_info.get("value") or 1
                             
                             leverage_str = f"Cross ({leverage_value}x)" if leverage_type == "cross" else f"{leverage_value}x"
                             
@@ -1795,6 +1807,11 @@ class SmartMoneyLiveBot:
                                 f"   • {pnl_emoji} PnL: ${unrealized_pnl:,.2f}\n"
                                 f"   • Precio Liq.: ${liq_price:,.2f}\n\n"
                             )
+                    else:
+                        logger.error(f"❌ Error en API Hyperliquid: Status {response.status}")
+                        error_text = await response.text()
+                        logger.error(f"Respuesta de error: {error_text}")
+                        message += f"\n⚠️ Error consultando API de Hyperliquid (Status: {response.status})\n"
             
             # Crear botón de refresh
             keyboard = InlineKeyboardMarkup([
