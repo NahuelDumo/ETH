@@ -53,7 +53,7 @@ class SmartMoneyScalpingBacktest:
         self.macd_slow = 26
         self.macd_signal = 9
 
-    def fetch_historical_data(self, days=2) -> pd.DataFrame:
+    def fetch_historical_data(self, days=10) -> pd.DataFrame:
         """Descarga datos históricos."""
         try:
             logger.info(f"Descargando datos para {self.symbol} ({self.timeframe}) de los últimos {days} días...")

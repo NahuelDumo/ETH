@@ -113,6 +113,10 @@ class SmartMoneyLiveBot:
         self.last_signal_times: Dict[str, Optional[pd.Timestamp]] = {s: None for s in self.symbols}
         self.ccxt_symbols: Dict[str, str] = {s: s.replace('USDT', '/USDT') for s in self.symbols}
         
+        # Sistema de cooldown para evitar reabrir posiciones inmediatamente después de cerrarlas
+        self.position_close_times: Dict[str, Optional[datetime]] = {s: None for s in self.symbols}
+        self.position_cooldown_seconds = 60  # Cooldown de 60 segundos después de cerrar una posición
+        
         # Rastreador de wallet
         self.wallet_tracker: Optional[WalletTracker] = None
         
@@ -560,19 +564,26 @@ class SmartMoneyLiveBot:
                  df_closed['min'] = np.nan
                  df_closed['max'] = np.nan
 
-            # 2. Calcular FVGs SÓLO en velas cerradas
+            # 2. Calcular FVGs SÓLO en velas cerradas (MÉTODO IDÉNTICO AL BACKTEST)
+            df_closed['is_fvg_bullish'] = False
+            df_closed['is_fvg_bearish'] = False
             df_closed['fvg_bull_high'], df_closed['fvg_bull_low'] = np.nan, np.nan
             df_closed['fvg_bear_high'], df_closed['fvg_bear_low'] = np.nan, np.nan
+            
             for i in range(2, len(df_closed)): 
                  if df_closed['low'].iloc[i] > df_closed['high'].iloc[i-2]:
+                     df_closed.loc[df_closed.index[i-1], 'is_fvg_bullish'] = True
                      df_closed.loc[df_closed.index[i-1], 'fvg_bull_low'] = df_closed['high'].iloc[i-2]
                      df_closed.loc[df_closed.index[i-1], 'fvg_bull_high'] = df_closed['low'].iloc[i]
                  if df_closed['high'].iloc[i] < df_closed['low'].iloc[i-2]:
+                     df_closed.loc[df_closed.index[i-1], 'is_fvg_bearish'] = True
                      df_closed.loc[df_closed.index[i-1], 'fvg_bear_low'] = df_closed['high'].iloc[i]
                      df_closed.loc[df_closed.index[i-1], 'fvg_bear_high'] = df_closed['low'].iloc[i-2]
             
-            # 3. Añadir NaNs a la vela actual
+            # 3. Añadir NaNs y False a la vela actual
             df_current['min'], df_current['max'] = np.nan, np.nan
+            df_current['is_fvg_bullish'] = False
+            df_current['is_fvg_bearish'] = False
             df_current['fvg_bull_high'], df_current['fvg_bull_low'] = np.nan, np.nan
             df_current['fvg_bear_high'], df_current['fvg_bear_low'] = np.nan, np.nan
             
@@ -821,30 +832,32 @@ class SmartMoneyLiveBot:
             return candidates[0]['price'] if candidates else None
 
     def check_long_setup(self, symbol: str, i: int) -> bool:
+        """Detecta setup LONG usando MÉTODO IDÉNTICO AL BACKTEST."""
         df = self.dfs[symbol]
-        if df is None or 'min' not in df.columns or 'fvg_bull_high' not in df.columns: return False # Asegurar que las columnas existan
+        if df is None or 'min' not in df.columns or 'is_fvg_bullish' not in df.columns: return False
 
-        # 'i' es el índice de la vela actual (en desarrollo)
-        # Buscamos estructura en velas cerradas (hasta i, excluyendo i)
         recent_lows = df['min'].iloc[i-50:i].dropna()
         if len(recent_lows) < 2 or recent_lows.iloc[-1] >= recent_lows.iloc[-2]: return False
         
-        # sweep_idx es el índice numérico (iloc)
         try:
-            sweep_idx = df.index.get_indexer([recent_lows.index[-1]])[0]
-        except IndexError:
+            sweep_idx = df.index.get_loc(recent_lows.index[-1])
+        except KeyError:
              return False # No se encontró el índice
 
         if i - sweep_idx > 12: return False
         
-        fvg_window = df.iloc[sweep_idx:i] # FVGs en velas cerradas
-        bullish_fvgs = fvg_window[['fvg_bull_low', 'fvg_bull_high']].dropna()
+        # MÉTODO BACKTEST: Usar columna booleana is_fvg_bullish
+        fvg_window = df.iloc[sweep_idx:i]
+        bullish_fvgs = fvg_window[fvg_window['is_fvg_bullish']]
         if bullish_fvgs.empty: return False
         
-        last_fvg = bullish_fvgs.iloc[-1]
+        # Obtener el índice de la última vela con FVG bullish
+        fvg_candle_idx = df.index.get_loc(bullish_fvgs.index[-1])
+        # Precio de entrada: low de la vela SIGUIENTE al FVG (igual que backtest)
+        fvg_high = df['low'].iloc[fvg_candle_idx + 1]
         
         # Compara el 'low' de la vela actual (en desarrollo)
-        if df['low'].iloc[i] <= last_fvg['fvg_bull_high']:
+        if df['low'].iloc[i] <= fvg_high:
             # Filtro MACD (usar vela cerrada previa, i-1)
             if self.enable_macd_filter:
                 if 'macd_hist' not in df.columns or i-2 < 0: return False
@@ -854,39 +867,43 @@ class SmartMoneyLiveBot:
                 if not (mh_prev > 0 and m_prev > ms_prev and mh_prev >= mh_prev2):
                     return False # Filtro MACD alcista no cumplido
             
-            entry_price = float(last_fvg['fvg_bull_high'])
+            entry_price = float(fvg_high)
             liquidity_level = float(recent_lows.iloc[-1])
-            # Pools 48h y selección de objetivo por concentración
             pools = self.build_liquidity_pools(df, i, lookback=self.pool_lookback_bars, tol=self.equal_tol)
             tp_pool = self.select_target_pool(df, i, 'LONG', entry_price, pools)
             
-            logger.info(f"🔍 [{symbol}] Setup LONG detectado en vela {df.index[i]}. TP_pool={tp_pool}")
+            logger.info(f"🔍 [{symbol}] Setup LONG detectado en vela {df.index[i]}. Entry=${entry_price:.4f}, TP_pool={tp_pool}")
             asyncio.create_task(self.open_position(symbol, i, 'LONG', entry_price, liquidity_level, tp_override=tp_pool))
             return True
         return False
 
     def check_short_setup(self, symbol: str, i: int) -> bool:
+        """Detecta setup SHORT usando MÉTODO IDÉNTICO AL BACKTEST."""
         df = self.dfs[symbol]
-        if df is None or 'max' not in df.columns or 'fvg_bear_low' not in df.columns: return False
+        if df is None or 'max' not in df.columns or 'is_fvg_bearish' not in df.columns: return False
 
         recent_highs = df['max'].iloc[i-50:i].dropna()
         if len(recent_highs) < 2 or recent_highs.iloc[-1] <= recent_highs.iloc[-2]: return False
 
         try:
-            sweep_idx = df.index.get_indexer([recent_highs.index[-1]])[0]
-        except IndexError:
+            sweep_idx = df.index.get_loc(recent_highs.index[-1])
+        except KeyError:
              return False # No se encontró el índice
 
         if i - sweep_idx > 12: return False
 
-        fvg_window = df.iloc[sweep_idx:i] # FVGs en velas cerradas
-        bearish_fvgs = fvg_window[['fvg_bear_low', 'fvg_bear_high']].dropna()
+        # MÉTODO BACKTEST: Usar columna booleana is_fvg_bearish
+        fvg_window = df.iloc[sweep_idx:i]
+        bearish_fvgs = fvg_window[fvg_window['is_fvg_bearish']]
         if bearish_fvgs.empty: return False
-            
-        last_fvg = bearish_fvgs.iloc[-1]
+        
+        # Obtener el índice de la última vela con FVG bearish
+        fvg_candle_idx = df.index.get_loc(bearish_fvgs.index[-1])
+        # Precio de entrada: high de la vela SIGUIENTE al FVG (igual que backtest)
+        fvg_low = df['high'].iloc[fvg_candle_idx + 1]
         
         # Compara el 'high' de la vela actual (en desarrollo)
-        if df['high'].iloc[i] >= last_fvg['fvg_bear_low']:
+        if df['high'].iloc[i] >= fvg_low:
             # Filtro MACD (usar vela cerrada previa, i-1)
             if self.enable_macd_filter:
                 if 'macd_hist' not in df.columns or i-2 < 0: return False
@@ -896,12 +913,12 @@ class SmartMoneyLiveBot:
                 if not (mh_prev < 0 and m_prev < ms_prev and mh_prev <= mh_prev2):
                     return False # Filtro MACD bajista no cumplido
 
-            entry_price = float(last_fvg['fvg_bear_low'])
+            entry_price = float(fvg_low)
             liquidity_level = float(recent_highs.iloc[-1])
             pools = self.build_liquidity_pools(df, i, lookback=self.pool_lookback_bars, tol=self.equal_tol)
             tp_pool = self.select_target_pool(df, i, 'SHORT', entry_price, pools)
             
-            logger.info(f"🔍 [{symbol}] Setup SHORT detectado en vela {df.index[i]}. TP_pool={tp_pool}")
+            logger.info(f"🔍 [{symbol}] Setup SHORT detectado en vela {df.index[i]}. Entry=${entry_price:.4f}, TP_pool={tp_pool}")
             asyncio.create_task(self.open_position(symbol, i, 'SHORT', entry_price, liquidity_level, tp_override=tp_pool))
             return True
         return False
@@ -913,6 +930,18 @@ class SmartMoneyLiveBot:
                             is_copy: bool = False): # <-- Flag añadido
         df = self.dfs[symbol]
         if df is None: return
+        
+        # Verificar cooldown después de cerrar una posición
+        if self.position_close_times.get(symbol):
+            time_since_close = (datetime.now() - self.position_close_times[symbol]).total_seconds()
+            if time_since_close < self.position_cooldown_seconds:
+                remaining_time = int(self.position_cooldown_seconds - time_since_close)
+                logger.warning(f"[{symbol}] Cooldown activo. No se puede abrir posición durante {remaining_time}s más.")
+                return
+            else:
+                # Cooldown completado, limpiar el registro
+                self.position_close_times[symbol] = None
+                logger.info(f"[{symbol}] Cooldown completado. Se puede abrir nueva posición.")
         
         # Obtener configuración específica del símbolo (si existe)
         symbol_config = self.symbol_configs.get(symbol, {})
@@ -1129,6 +1158,10 @@ class SmartMoneyLiveBot:
             
             # Limpiar posición
             self.positions[symbol] = None
+            
+            # Registrar tiempo de cierre para cooldown
+            self.position_close_times[symbol] = datetime.now()
+            logger.info(f"[{symbol}] Cooldown activado: no se abrirán nuevas posiciones durante {self.position_cooldown_seconds}s")
             
             # Guardar estado persistente
             await self._save_persistent_positions()
@@ -1379,22 +1412,25 @@ class SmartMoneyLiveBot:
                                 logger.info(f"↩️ Límite de {self.max_concurrent_open} posiciones alcanzado, saltando nuevas entradas.")
                                 continue
                             # --- INICIO MODIFICACIÓN (Control de vela repetida) ---
-                            # Usamos el time de la vela actual para el control
+                            # Solo bloquear si YA ABRIMOS una posición en esta vela
+                            # NO bloquear si solo verificamos sin abrir
                             last_time = self.last_signal_times[symbol]
                             
-                            # Si ya procesamos una señal en esta misma vela en desarrollo
+                            # Si ya ABRIMOS una posición en esta misma vela, no buscar más setups
                             if last_time and last_time == current_candle_time:
-                                logger.info(f"   [{symbol}] Setup de la vela {last_time} ya procesado, esperando siguiente vela...")
+                                logger.debug(f"   [{symbol}] Ya se abrió posición en vela {last_time}, esperando siguiente vela...")
                                 continue
                             # --- FIN MODIFICACIÓN ---
 
                             # El chequeo de setup usa el 'idx' actual (en desarrollo)
+                            # Estos métodos ahora pueden ejecutarse múltiples veces en la misma vela
+                            # hasta que se abra una posición
                             if self.check_long_setup(symbol, idx):
                                 pass
                             elif self.check_short_setup(symbol, idx):
                                 pass
                             else:
-                                logger.info(f"   [{symbol}] No se encontraron setups válidos en la vela actual.")
+                                logger.debug(f"   [{symbol}] No se encontraron setups válidos en la vela actual.")
                     
                     except Exception as e:
                         logger.error(f"Error procesando el símbolo {symbol}: {e}", exc_info=True)
@@ -1586,6 +1622,12 @@ class SmartMoneyLiveBot:
             if not symbol:
                  logger.warning(f"Símbolo {original_symbol} (buscado como {possible_symbols}) de wallet rastreada no está en la lista de símbolos monitoreados: {current_monitored_symbols}. Ignorando copy trade.")
                  return
+            
+            # Asegurar que el símbolo esté inicializado en los diccionarios de control
+            if symbol not in self.position_close_times:
+                self.position_close_times[symbol] = None
+            if symbol not in self.last_signal_times:
+                self.last_signal_times[symbol] = None
 
             # Verificar si ya tenemos posición en este símbolo
             # Usamos `is not None` para asegurarnos
@@ -1614,6 +1656,16 @@ class SmartMoneyLiveBot:
             # Usar precio actual (último cierre disponible)
             current_price = df['close'].iloc[-1]
             direction = tracked_position.position_type.upper() # Asegurar que sea 'LONG' o 'SHORT'
+            
+            # Validar que el precio actual sea diferente al último precio de entrada registrado
+            # Esto evita reabrir con el mismo precio si hay un problema de sincronización
+            if symbol in self.last_signal_times and self.last_signal_times[symbol] is not None:
+                # Verificar que haya pasado al menos una vela desde la última señal
+                last_signal_time = self.last_signal_times[symbol]
+                current_candle_time = df.index[-1]
+                if current_candle_time <= last_signal_time:
+                    logger.warning(f"[{symbol}] Ignorando copy trade: misma vela que la última señal ({current_candle_time})")
+                    return
             
             # USAR EL MISMO APALANCAMIENTO que la wallet rastreada si está disponible
             wallet_leverage = tracked_position.leverage
