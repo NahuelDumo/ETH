@@ -29,7 +29,7 @@ class SmartMoneyScalpingBacktest:
         self.structure_lookback = 20
         self.risk_reward_ratio = self.symbol_config.get('risk_reward_ratio', 2)
         self.leverage = 20
-        self.risk_per_trade_pct = 0.05
+        self.risk_per_trade_pct = 0.05 #riesgo por trade
         self.max_candles_in_trade = 24
         # Parámetros Pools de Liquidez (48h ≈ 576 velas de 15m)
         self.pool_lookback_bars = 192  # 48h de velas de 15m

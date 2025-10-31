@@ -104,6 +104,8 @@ class SmartMoneyLiveBot:
         self.excel_filenames: Dict[str, str] = {}
         self.dfs: Dict[str, Optional[pd.DataFrame]] = {s: None for s in self.symbols}
         self.positions: Dict[str, Optional[Position]] = {s: None for s in self.symbols}
+        # Posiciones de copy trading separadas (permite COPY + SMC simultáneamente)
+        self.copy_positions: Dict[str, Optional[Position]] = {s: None for s in self.symbols}
         
         # Archivo para guardar posiciones abiertas
         self.positions_persistence_file = 'live_positions_state.json'
@@ -372,54 +374,57 @@ class SmartMoneyLiveBot:
     # --- Métodos de Persistencia ---
 
     def _load_persistent_positions(self) -> None:
-        """Carga las posiciones abiertas desde un archivo JSON al iniciar."""
+        """Carga las posiciones abiertas (SMC y COPY) desde un archivo JSON al iniciar."""
         if not os.path.exists(self.positions_persistence_file):
-            logger.info("No se encontró archivo de estado de posiciones (live_positions_state.json). Empezando de cero.")
+            logger.info("No se encontró archivo de estado de posiciones. Empezando de cero.")
             return
 
         try:
             with open(self.positions_persistence_file, 'r') as f:
                 persistent_data = json.load(f)
             
-            reloaded_count = 0
-            # Usamos list(persistent_data.items()) para evitar error si el dict cambia durante iteración
-            for symbol, pos_data in list(persistent_data.items()): 
+            smc_reloaded = 0
+            copy_reloaded = 0
+            
+            # Cargar posiciones SMC
+            smc_positions = persistent_data.get('smc_positions', persistent_data)  # Fallback a formato antiguo
+            for symbol, pos_data in list(smc_positions.items()):
                 if symbol in self.symbols and pos_data is not None:
-                    # Asegurar que todos los campos esperados existan, con default para 'is_copy'
-                    pos_data.setdefault('is_copy', False) # Añade is_copy=False si no existe (compatibilidad)
-                    
-                    # Convertir el string ISO de vuelta a datetime
+                    pos_data.setdefault('is_copy', False)
                     pos_data['entry_time'] = datetime.fromisoformat(pos_data['entry_time'])
                     
-                    # Recrear el objeto Position
                     try:
-                        # Asegurar que los campos numéricos sean float (JSON puede cargarlos como int a veces)
-                        pos_data['size'] = float(pos_data['size'])
-                        pos_data['entry_price'] = float(pos_data['entry_price'])
-                        pos_data['stop_loss'] = float(pos_data['stop_loss'])
-                        pos_data['original_stop_loss'] = float(pos_data['original_stop_loss'])
-                        pos_data['take_profit'] = float(pos_data['take_profit'])
-                        pos_data['liquidation_price'] = float(pos_data['liquidation_price'])
-                        pos_data['margin_used'] = float(pos_data['margin_used'])
+                        # Convertir a float
+                        for field in ['size', 'entry_price', 'stop_loss', 'original_stop_loss', 'take_profit', 'liquidation_price', 'margin_used']:
+                            pos_data[field] = float(pos_data[field])
                         
                         self.positions[symbol] = Position(**pos_data)
-                        reloaded_count += 1
-                        copy_status = "(COPY)" if pos_data['is_copy'] else "(SMC)"
-                        logger.info(f"🔄 Posición persistente para {symbol} {copy_status} ({pos_data['direction']}) recargada.")
-                    except TypeError as te:
-                         logger.error(f"Error al recrear Position para {symbol} desde JSON: {te}. Datos: {pos_data}", exc_info=True)
-                         # Si falla la recreación, mejor no cargarla para evitar errores posteriores
-                         if symbol in self.positions:
-                             self.positions[symbol] = None 
-                    except KeyError as ke:
-                         logger.error(f"Falta el campo '{ke}' en los datos JSON para {symbol}. Datos: {pos_data}. No se puede recargar.")
-                         if symbol in self.positions:
-                             self.positions[symbol] = None
-                elif symbol not in self.symbols and pos_data is not None:
-                     logger.warning(f"Se encontró posición persistente para {symbol} pero no está en la lista actual de símbolos ({self.symbols}). Ignorando.")
+                        smc_reloaded += 1
+                        logger.info(f"🔄 Posición SMC para {symbol} ({pos_data['direction']}) recargada.")
+                    except (TypeError, KeyError) as e:
+                        logger.error(f"Error al recrear Position SMC para {symbol}: {e}")
+                        self.positions[symbol] = None
+            
+            # Cargar posiciones COPY
+            copy_positions = persistent_data.get('copy_positions', {})
+            for symbol, pos_data in list(copy_positions.items()):
+                if symbol in self.symbols and pos_data is not None:
+                    pos_data.setdefault('is_copy', True)
+                    pos_data['entry_time'] = datetime.fromisoformat(pos_data['entry_time'])
+                    
+                    try:
+                        for field in ['size', 'entry_price', 'stop_loss', 'original_stop_loss', 'take_profit', 'liquidation_price', 'margin_used']:
+                            pos_data[field] = float(pos_data[field])
+                        
+                        self.copy_positions[symbol] = Position(**pos_data)
+                        copy_reloaded += 1
+                        logger.info(f"🔄 Posición COPY para {symbol} ({pos_data['direction']}) recargada.")
+                    except (TypeError, KeyError) as e:
+                        logger.error(f"Error al recrear Position COPY para {symbol}: {e}")
+                        self.copy_positions[symbol] = None
 
-            if reloaded_count > 0:
-                 logger.info(f"✅ Se recargaron {reloaded_count} posiciones abiertas.")
+            if smc_reloaded > 0 or copy_reloaded > 0:
+                logger.info(f"✅ Se recargaron {smc_reloaded} posiciones SMC y {copy_reloaded} posiciones COPY.")
 
         except json.JSONDecodeError:
             logger.error(f"Error al decodificar JSON desde {self.positions_persistence_file}. El archivo podría estar corrupto o vacío.")
@@ -441,34 +446,47 @@ class SmartMoneyLiveBot:
 
 
     async def _save_persistent_positions(self) -> None:
-        """Guarda el estado actual de self.positions en un archivo JSON."""
-        logger.debug("Guardando estado de posiciones persistentes...")
-        temp_file = self.positions_persistence_file + ".tmp" # Definir archivo temporal
+        """Guarda el estado actual de self.positions Y self.copy_positions en un archivo JSON."""
+        logger.debug("Guardando estado de posiciones persistentes (SMC + COPY)...")
+        temp_file = self.positions_persistence_file + ".tmp"
         try:
-            # Crear un diccionario serializable
-            serializable_positions = {}
+            # Crear estructura con ambos tipos de posiciones
+            persistent_data = {
+                'smc_positions': {},
+                'copy_positions': {}
+            }
+            
+            # Guardar posiciones SMC
             for symbol, pos in self.positions.items():
                 if pos is not None:
-                    # Convertir objeto Position a dict
                     pos_dict = asdict(pos)
-                    # Convertir datetime a string ISO 8601
-                    # Asegurarse que entry_time es datetime antes de llamar isoformat
                     if isinstance(pos_dict['entry_time'], datetime):
                         pos_dict['entry_time'] = pos_dict['entry_time'].isoformat()
                     else:
-                        # Si por alguna razón no es datetime, loguear error y no guardar esa pos
-                        logger.error(f"Tipo inesperado para entry_time en posición {symbol}: {type(pos_dict['entry_time'])}. No se guardará esta posición.")
-                        continue # Saltar esta posición al guardar
-                    serializable_positions[symbol] = pos_dict
+                        logger.error(f"Tipo inesperado para entry_time en posición SMC {symbol}: {type(pos_dict['entry_time'])}.")
+                        continue
+                    persistent_data['smc_positions'][symbol] = pos_dict
                 else:
-                    serializable_positions[symbol] = None # Guardar None para posiciones cerradas
+                    persistent_data['smc_positions'][symbol] = None
             
-            # Escribir a disco de forma segura (atomic write)
+            # Guardar posiciones COPY
+            for symbol, pos in self.copy_positions.items():
+                if pos is not None:
+                    pos_dict = asdict(pos)
+                    if isinstance(pos_dict['entry_time'], datetime):
+                        pos_dict['entry_time'] = pos_dict['entry_time'].isoformat()
+                    else:
+                        logger.error(f"Tipo inesperado para entry_time en posición COPY {symbol}: {type(pos_dict['entry_time'])}.")
+                        continue
+                    persistent_data['copy_positions'][symbol] = pos_dict
+                else:
+                    persistent_data['copy_positions'][symbol] = None
+            
+            # Escribir a disco de forma segura
             with open(temp_file, 'w') as f:
-                json.dump(serializable_positions, f, indent=4)
-            # Renombrar el archivo temporal al final (operación atómica en la mayoría de S.O.)
+                json.dump(persistent_data, f, indent=4)
             os.replace(temp_file, self.positions_persistence_file) 
-            logger.debug(f"✅ Estado de posiciones guardado en {self.positions_persistence_file}.")
+            logger.debug(f"✅ Estado de posiciones guardado (SMC + COPY) en {self.positions_persistence_file}.")
 
         except Exception as e:
             logger.error(f"Error crítico al guardar estado de posiciones en {self.positions_persistence_file}: {e}", exc_info=True)
@@ -1070,12 +1088,18 @@ class SmartMoneyLiveBot:
             logger.error(f"Error creando objeto Position para {symbol}: {e}", exc_info=True)
             return
 
-        # Guardar en memoria y persistencia
-        self.positions[symbol] = pos
+        # Guardar en memoria según el tipo de posición
+        if is_copy:
+            self.copy_positions[symbol] = pos
+            logger.info(f"💾 Posición COPY guardada en copy_positions[{symbol}]")
+        else:
+            self.positions[symbol] = pos
+            # Actualizar último tiempo de señal SOLO para trades SMC
+            self.last_signal_times[symbol] = df.index[entry_idx]
+            logger.info(f"💾 Posición SMC guardada en positions[{symbol}]")
+        
         # Guardar estado ANTES de enviar notificación/orden real
         await self._save_persistent_positions() 
-        # Actualizar último tiempo de señal para evitar repetición en la misma vela
-        self.last_signal_times[symbol] = df.index[entry_idx] 
 
         logger.info(f"📢 [{symbol}] Señal {log_prefix} {direction}: Tamaño {position_size:.4f} @ ${entry_price:.4f}")
         logger.info(f"   SL: ${stop_loss_price:.4f}, TP: ${take_profit_price:.4f}, Liq: ${liquidation_price:.4f}, Margen: ${margin_used:.2f}")
@@ -1156,12 +1180,15 @@ class SmartMoneyLiveBot:
             # Notificar por Telegram
             await self.notify_exit(trade_record)
             
-            # Limpiar posición
-            self.positions[symbol] = None
-            
-            # Registrar tiempo de cierre para cooldown
-            self.position_close_times[symbol] = datetime.now()
-            logger.info(f"[{symbol}] Cooldown activado: no se abrirán nuevas posiciones durante {self.position_cooldown_seconds}s")
+            # Limpiar posición del diccionario correcto
+            if pos.is_copy:
+                self.copy_positions[symbol] = None
+                logger.info(f"[{symbol}] Posición COPY cerrada y limpiada de copy_positions")
+            else:
+                self.positions[symbol] = None
+                # Registrar tiempo de cierre para cooldown SOLO en posiciones SMC
+                self.position_close_times[symbol] = datetime.now()
+                logger.info(f"[{symbol}] Cooldown activado: no se abrirán nuevas posiciones SMC durante {self.position_cooldown_seconds}s")
             
             # Guardar estado persistente
             await self._save_persistent_positions()
@@ -1172,20 +1199,23 @@ class SmartMoneyLiveBot:
             logger.error(f"[{symbol}] Error al cerrar posición: {e}", exc_info=True)
             await self.send_telegram_message(f"🚨 Error crítico al cerrar {symbol}: {e}")
     
-    async def manage_position(self, symbol: str, idx: int):
+    async def manage_position(self, symbol: str, idx: int, is_copy: bool = False):
         """
-        Gestiona la salida de un trade activo (SMC) usando la lógica HÍBRIDA (BASADA EN TIEMPO).
-        IGNORA las posiciones abiertas por copy trading.
+        Gestiona la salida de un trade activo (SMC o COPY).
+        Ahora soporta gestión separada de posiciones COPY y SMC.
         """
-        pos = self.positions.get(symbol) # Usar .get() para evitar KeyError si se eliminó
-        
-        # --- SALIDA TEMPRANA SI NO HAY POSICIÓN O ES COPIA ---
-        if not pos or pos.is_copy:
-            if pos and pos.is_copy:
-                 logger.debug(f"[{symbol}] Ignorando gestión interna (es copia). Esperando señal de cierre de wallet.")
-            # Si no hay posición (pos es None), no hacer nada
-            return 
-        # --- FIN SALIDA TEMPRANA ---
+        # Obtener la posición correcta según el tipo
+        if is_copy:
+            pos = self.copy_positions.get(symbol)
+            if not pos:
+                return  # No hay posición COPY para gestionar
+            # Las posiciones COPY se gestionan por señales de la wallet, no por SL/TP interno
+            logger.debug(f"[{symbol}] Posición COPY activa, esperando señal de cierre de wallet.")
+            return
+        else:
+            pos = self.positions.get(symbol)
+            if not pos:
+                return  # No hay posición SMC para gestionar
 
         # --- A partir de aquí, SÓLO se ejecuta para posiciones SMC ---
         
@@ -1402,35 +1432,52 @@ class SmartMoneyLiveBot:
                         
                         logger.info(f"🕵️ [{symbol}] Analizando vela {current_candle_time.strftime('%H:%M:%S')} (Precio actual: ${current_price:,.4f})...")
 
-                        if self.positions[symbol]:
-                            # La gestión de SL/TP usa el 'idx' actual (en desarrollo)
+                        # Gestionar posiciones existentes (SMC y COPY por separado)
+                        smc_position = self.positions[symbol]
+                        copy_position = self.copy_positions[symbol]
+                        
+                        # Gestionar posición SMC si existe
+                        if smc_position:
                             await self.manage_position(symbol, idx)
-                        else:
-                            # Límite global de posiciones concurrentes
-                            open_count = sum(1 for p in self.positions.values() if p is not None)
-                            if open_count >= self.max_concurrent_open:
-                                logger.info(f"↩️ Límite de {self.max_concurrent_open} posiciones alcanzado, saltando nuevas entradas.")
-                                continue
-                            # --- INICIO MODIFICACIÓN (Control de vela repetida) ---
-                            # Solo bloquear si YA ABRIMOS una posición en esta vela
-                            # NO bloquear si solo verificamos sin abrir
-                            last_time = self.last_signal_times[symbol]
-                            
-                            # Si ya ABRIMOS una posición en esta misma vela, no buscar más setups
-                            if last_time and last_time == current_candle_time:
-                                logger.debug(f"   [{symbol}] Ya se abrió posición en vela {last_time}, esperando siguiente vela...")
-                                continue
-                            # --- FIN MODIFICACIÓN ---
+                        
+                        # Gestionar posición COPY si existe
+                        if copy_position:
+                            await self.manage_position(symbol, idx, is_copy=True)
+                        
+                        # Decidir si buscar nuevos setups SMC
+                        if smc_position:
+                            # Ya hay posición SMC, NO buscar más setups SMC
+                            logger.debug(f"   [{symbol}] Posición SMC activa, no se buscan más setups SMC.")
+                            continue
+                        
+                        # Límite global de posiciones concurrentes (SMC + COPY)
+                        smc_count = sum(1 for p in self.positions.values() if p is not None)
+                        copy_count = sum(1 for p in self.copy_positions.values() if p is not None)
+                        total_open = smc_count + copy_count
+                        
+                        if total_open >= self.max_concurrent_open:
+                            logger.info(f"↩️ Límite de {self.max_concurrent_open} posiciones alcanzado ({smc_count} SMC + {copy_count} COPY), saltando nuevas entradas.")
+                            continue
+                        
+                        # --- INICIO MODIFICACIÓN (Control de vela repetida) ---
+                        # Solo bloquear si YA ABRIMOS una posición SMC en esta vela
+                        last_time = self.last_signal_times[symbol]
+                        
+                        # Si ya ABRIMOS una posición SMC en esta misma vela, no buscar más setups
+                        if last_time and last_time == current_candle_time:
+                            logger.debug(f"   [{symbol}] Ya se abrió posición SMC en vela {last_time}, esperando siguiente vela...")
+                            continue
+                        # --- FIN MODIFICACIÓN ---
 
-                            # El chequeo de setup usa el 'idx' actual (en desarrollo)
-                            # Estos métodos ahora pueden ejecutarse múltiples veces en la misma vela
-                            # hasta que se abra una posición
-                            if self.check_long_setup(symbol, idx):
-                                pass
-                            elif self.check_short_setup(symbol, idx):
-                                pass
-                            else:
-                                logger.debug(f"   [{symbol}] No se encontraron setups válidos en la vela actual.")
+                        # El chequeo de setup usa el 'idx' actual (en desarrollo)
+                        # Estos métodos ahora pueden ejecutarse múltiples veces en la misma vela
+                        # hasta que se abra una posición
+                        if self.check_long_setup(symbol, idx):
+                            pass
+                        elif self.check_short_setup(symbol, idx):
+                            pass
+                        else:
+                            logger.debug(f"   [{symbol}] No se encontraron setups válidos en la vela actual.")
                     
                     except Exception as e:
                         logger.error(f"Error procesando el símbolo {symbol}: {e}", exc_info=True)
@@ -1629,18 +1676,25 @@ class SmartMoneyLiveBot:
             if symbol not in self.last_signal_times:
                 self.last_signal_times[symbol] = None
 
-            # Verificar si ya tenemos posición en este símbolo
-            # Usamos `is not None` para asegurarnos
-            if self.positions.get(symbol) is not None:
-                pos_info = self.positions[symbol]
-                logger.warning(f"Ya tenemos posición abierta en {symbol} ({pos_info.direction}, Copy={pos_info.is_copy}, Entry=${pos_info.entry_price:.4f}). Ignorando nuevo copy trade.")
+            # Verificar si ya tenemos posición COPY en este símbolo
+            existing_copy = self.copy_positions.get(symbol)
+            if existing_copy is not None:
+                logger.warning(f"Ya tenemos posición COPY abierta en {symbol} ({existing_copy.direction}, Entry=${existing_copy.entry_price:.4f}). Ignorando nuevo copy trade.")
                 return
             
-            # Verificar límite de posiciones concurrentes
-            open_count = sum(1 for p in self.positions.values() if p is not None)
-            if open_count >= self.max_concurrent_open:
-                logger.warning(f"Límite de {self.max_concurrent_open} posiciones concurrentes alcanzado ({open_count}). Ignorando copy trade para {symbol}.")
-                await self.send_telegram_message(f"⚠️ Límite de {self.max_concurrent_open} posiciones alcanzado. No se pudo copiar {symbol} {tracked_position.position_type}.")
+            # Verificar si hay posición SMC (esto está permitido, son independientes)
+            existing_smc = self.positions.get(symbol)
+            if existing_smc is not None:
+                logger.info(f"✅ Posición SMC activa en {symbol}, pero se permite COPY TRADE (riesgo independiente).")
+            
+            # Verificar límite de posiciones concurrentes (SMC + COPY)
+            smc_count = sum(1 for p in self.positions.values() if p is not None)
+            copy_count = sum(1 for p in self.copy_positions.values() if p is not None)
+            total_open = smc_count + copy_count
+            
+            if total_open >= self.max_concurrent_open:
+                logger.warning(f"Límite de {self.max_concurrent_open} posiciones concurrentes alcanzado ({smc_count} SMC + {copy_count} COPY). Ignorando copy trade para {symbol}.")
+                await self.send_telegram_message(f"⚠️ Límite de {self.max_concurrent_open} posiciones alcanzado ({smc_count} SMC + {copy_count} COPY). No se pudo copiar {symbol} {tracked_position.position_type}.")
                 return
             
             # Obtener datos actuales del mercado para el símbolo detectado
