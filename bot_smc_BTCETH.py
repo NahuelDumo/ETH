@@ -119,6 +119,10 @@ class SmartMoneyLiveBot:
         self.position_close_times: Dict[str, Optional[datetime]] = {s: None for s in self.symbols}
         self.position_cooldown_seconds = 60  # Cooldown de 60 segundos después de cerrar una posición
         
+        # Sistema para evitar reabrir en el mismo precio después de un Stop Loss
+        self.failed_entry_prices: Dict[str, list] = {s: [] for s in self.symbols}  # Lista de precios que fallaron
+        self.failed_entry_tolerance = 0.001  # 0.1% de tolerancia para considerar "mismo precio"
+        
         # Rastreador de wallet
         self.wallet_tracker: Optional[WalletTracker] = None
         
@@ -961,6 +965,15 @@ class SmartMoneyLiveBot:
                 self.position_close_times[symbol] = None
                 logger.info(f"[{symbol}] Cooldown completado. Se puede abrir nueva posición.")
         
+        # NUEVA VALIDACIÓN: Verificar si este precio de entrada ya falló antes (solo para SMC)
+        if not is_copy and symbol in self.failed_entry_prices:
+            for failed_price in self.failed_entry_prices[symbol]:
+                price_diff_pct = abs(entry_price - failed_price) / failed_price
+                if price_diff_pct < self.failed_entry_tolerance:
+                    logger.warning(f"[{symbol}] ⚠️ Precio de entrada ${entry_price:.4f} ya falló antes (${failed_price:.4f}). "
+                                 f"Ignorando setup para evitar pérdidas repetidas.")
+                    return
+        
         # Obtener configuración específica del símbolo (si existe)
         symbol_config = self.symbol_configs.get(symbol, {})
         tp_percentage = symbol_config.get('tp_percentage', 2.0) 
@@ -1189,6 +1202,17 @@ class SmartMoneyLiveBot:
                 # Registrar tiempo de cierre para cooldown SOLO en posiciones SMC
                 self.position_close_times[symbol] = datetime.now()
                 logger.info(f"[{symbol}] Cooldown activado: no se abrirán nuevas posiciones SMC durante {self.position_cooldown_seconds}s")
+                
+                # Si cerró por Stop Loss, registrar el precio de entrada como fallido
+                if "Stop Loss" in reason and pnl < 0:
+                    if symbol not in self.failed_entry_prices:
+                        self.failed_entry_prices[symbol] = []
+                    self.failed_entry_prices[symbol].append(pos.entry_price)
+                    # Mantener solo los últimos 5 precios fallidos
+                    if len(self.failed_entry_prices[symbol]) > 5:
+                        self.failed_entry_prices[symbol].pop(0)
+                    logger.warning(f"[{symbol}] 🚫 Precio de entrada ${pos.entry_price:.4f} registrado como FALLIDO. "
+                                 f"No se reabrirá en este nivel. Total fallidos: {len(self.failed_entry_prices[symbol])}")
             
             # Guardar estado persistente
             await self._save_persistent_positions()
@@ -1675,6 +1699,8 @@ class SmartMoneyLiveBot:
                 self.position_close_times[symbol] = None
             if symbol not in self.last_signal_times:
                 self.last_signal_times[symbol] = None
+            if symbol not in self.failed_entry_prices:
+                self.failed_entry_prices[symbol] = []
 
             # Verificar si ya tenemos posición COPY en este símbolo
             existing_copy = self.copy_positions.get(symbol)
