@@ -172,7 +172,9 @@ class SmartMoneyLiveBot:
         logger.info("Configurando ccxt (Binance Futures) para obtener datos históricos...")
         self.data_exchange = ccxt.binance({
             'enableRateLimit': True,
-            'options': {'defaultType': 'future'}
+            'options': {'defaultType': 'future'},
+            'timeout': 30000,  # 30 segundos de timeout
+            'rateLimit': 1200  # Esperar más entre requests
         })
         
         self.is_running: bool = False
@@ -284,7 +286,7 @@ class SmartMoneyLiveBot:
                 # Obtener actualizaciones de Telegram
                 updates = await self.telegram_bot.get_updates(
                     offset=self.last_update_id + 1,
-                    timeout=10
+                    timeout=30  # Aumentado de 10 a 30 segundos
                 )
                 
                 for update in updates:
@@ -530,10 +532,23 @@ class SmartMoneyLiveBot:
 
             while True:
                 logger.debug(f"   [{symbol}] Descargando chunk desde timestamp {since}...")
-                ohlcv = await asyncio.to_thread(
-                    self.data_exchange.fetch_ohlcv,
-                    ccxt_symbol, self.timeframe, since=since, limit=limit_per_request
-                )
+                
+                # Reintentar hasta 3 veces en caso de error de red
+                for retry in range(3):
+                    try:
+                        ohlcv = await asyncio.to_thread(
+                            self.data_exchange.fetch_ohlcv,
+                            ccxt_symbol, self.timeframe, since=since, limit=limit_per_request
+                        )
+                        break  # Si tuvo éxito, salir del loop de reintentos
+                    except Exception as e:
+                        if retry < 2:  # Si no es el último intento
+                            logger.warning(f"   [{symbol}] Error descargando datos (intento {retry+1}/3): {e}. Reintentando...")
+                            await asyncio.sleep(2)  # Esperar 2 segundos antes de reintentar
+                        else:
+                            logger.error(f"   [{symbol}] Error descargando datos después de 3 intentos: {e}")
+                            raise
+                
                 if not ohlcv:
                     logger.info(f"   [{symbol}] No más datos disponibles.")
                     break
